@@ -36,12 +36,23 @@ b = 14.0          # section width
 h = 20.0          # section depth
 cover_bar = 3.0   # distance from edge to center of bars
 
-# Steel layers: (depth from top in inches, number of bars)
+# Steel bars: each entry is (depth from top, x from left, area)
 # #9 bars: A_bar = 1.00 in^2
 A_bar = 1.00
+x_core_left = 2.0   # core left edge (clear cover)
+x_core_right = 12.0  # core right edge (b - clear cover)
+steel_bars = [
+    # Layer 1: 3 #9 at 3" from top
+    (3.0, 3.5, A_bar), (3.0, 7.0, A_bar), (3.0, 10.5, A_bar),
+    # Layer 2: 2 #9 at 10" from top
+    (10.0, 3.5, A_bar), (10.0, 10.5, A_bar),
+    # Layer 3: 3 #9 at 17" from top
+    (17.0, 3.5, A_bar), (17.0, 7.0, A_bar), (17.0, 10.5, A_bar),
+]
+# Grouped by layer for print logic
 steel_layers = [
     (3.0,  3),   # 3 #9 bars at 3" from top
-    (10.0, 2),   # 2 #9 bars at 10" from top (mid-height)
+    (10.0, 2),   # 2 #9 bars at 10" from top
     (17.0, 3),   # 3 #9 bars at 17" from top
 ]
 
@@ -157,34 +168,36 @@ def compute_section_response(eps_cm, c, mode="whole"):
         eps_c = eps_cm * (c - y) / c
 
         if mode == "whole":
-            stress_psi = concrete_stress_confined(eps_c)
+            force = concrete_stress_confined(eps_c) * b * strip_h / 1000.0
         else:
             if y_core_top <= y <= y_core_bot:
-                stress_psi = concrete_stress_confined(eps_c)
+                # Core depth: split width into confined core + unconfined side covers
+                force_core = concrete_stress_confined(eps_c) * b_core * strip_h / 1000.0
+                force_cover = concrete_stress_unconfined(eps_c) * (b - b_core) * strip_h / 1000.0
+                force = force_core + force_cover
             else:
-                stress_psi = concrete_stress_unconfined(eps_c)
-
-        force = stress_psi * b * strip_h / 1000.0
+                # Top/bottom cover: fully unconfined across entire width
+                force = concrete_stress_unconfined(eps_c) * b * strip_h / 1000.0
         lever = centroid - y
         total_force += force
         total_moment += force * lever
 
-    # Steel layers
-    for (d_i, n_bars) in steel_layers:
+    # Steel bars (individual, with x-position for cover/core check)
+    for (d_i, x_i, A_s) in steel_bars:
         eps_s = eps_cm * (c - d_i) / c
         f_s = steel_stress_ksi(-eps_s, strain_hardening=use_sh)
-        A_s = n_bars * A_bar
         force_steel_kips = -f_s * A_s
+
+        # Is this bar in the confined core?
+        in_core = (y_core_top <= d_i <= y_core_bot and
+                   x_core_left <= x_i <= x_core_right)
 
         # Subtract displaced concrete
         if eps_s > 0:
-            if mode == "whole":
+            if mode == "whole" or in_core:
                 conc_stress = concrete_stress_confined(eps_s)
             else:
-                if y_core_top <= d_i <= y_core_bot:
-                    conc_stress = concrete_stress_confined(eps_s)
-                else:
-                    conc_stress = concrete_stress_unconfined(eps_s)
+                conc_stress = concrete_stress_unconfined(eps_s)
             displaced_conc_force = conc_stress * A_s / 1000.0
         else:
             displaced_conc_force = 0.0
@@ -224,16 +237,23 @@ def run_moment_curvature(mode="whole"):
     eps_values = np.arange(0.0002, eps_max + 0.0001, 0.0002)
 
     phi_list, M_list, c_list, eps_list = [], [], [], []
+    skipped = 0
 
     for eps_cm in eps_values:
         c = find_neutral_axis(eps_cm, mode)
         if c is None:
+            skipped += 1
             continue
         _, M = compute_section_response(eps_cm, c, mode)
         phi_list.append(eps_cm / c)
         M_list.append(M / 12.0)
         c_list.append(c)
         eps_list.append(eps_cm)
+
+    if skipped > 0:
+        print(f"  WARNING: {skipped}/{len(eps_values)} points did not converge")
+    if len(eps_list) == 0:
+        print("  ERROR: no points converged, check brackets or model")
 
     return (np.array(eps_list), np.array(phi_list),
             np.array(M_list), np.array(c_list))
@@ -249,7 +269,7 @@ MODE_NAMES = {
 
 def print_parameters():
     print("=" * 60)
-    print("CE 676 - Assignment 3: Moment-Curvature Analysis")
+    print("Moment-Curvature Analysis")
     print("Modified Kent & Park Model")
     print("=" * 60)
 
@@ -282,6 +302,10 @@ def print_results_table(eps_arr, phi_arr, M_arr, c_arr, mode):
     print(f"{'=' * 70}")
     print(f"{'eps_cm':>20s}  {'c (in)':>8s}  {'phi (1/in)':>12s}  {'M (kip-ft)':>12s}")
     print("-" * 70)
+
+    if len(eps_arr) == 0:
+        print("  No converged results to display.")
+        return
 
     for strain_val, label in zip(key_strains, key_labels):
         idx = np.argmin(np.abs(eps_arr - strain_val))
@@ -393,12 +417,13 @@ def plot_moment_curvature(results_by_mode, out_dir):
     key_labels = ["0.001", "0.002", "0.003", "0.004", "0.005",
                   "$\\varepsilon_{20,c}$"]
 
-    for strain_val, label in zip(key_strains, key_labels):
-        idx = np.argmin(np.abs(eps_arr - strain_val))
-        if abs(eps_arr[idx] - strain_val) < 0.0003:
-            ax2.plot(phi_arr[idx], M_arr[idx], 'ro', markersize=5)
-            ax2.annotate(label, (phi_arr[idx], M_arr[idx]),
-                         textcoords="offset points", xytext=(8, 5), fontsize=7)
+    if len(eps_arr) > 0:
+        for strain_val, label in zip(key_strains, key_labels):
+            idx = np.argmin(np.abs(eps_arr - strain_val))
+            if abs(eps_arr[idx] - strain_val) < 0.0003:
+                ax2.plot(phi_arr[idx], M_arr[idx], 'ro', markersize=5)
+                ax2.annotate(label, (phi_arr[idx], M_arr[idx]),
+                             textcoords="offset points", xytext=(8, 5), fontsize=7)
 
     ax2.set_xlabel('Curvature, $\\phi$ (1/in)', fontsize=13)
     ax2.set_ylabel('Moment, M (kip-ft)', fontsize=13)
@@ -421,6 +446,8 @@ def plot_moment_curvature(results_by_mode, out_dir):
                         f'{e_arr[i]:.6f},{ca_arr[i]:.4f}\n')
 
     # Key points CSV (primary mode)
+    if len(eps_arr) == 0:
+        return fig2
     with open(f'{out_dir}/key_points.csv', 'w') as f:
         f.write('label,phi,moment_kipft,eps_cm\n')
         all_key = [0.001, 0.002, 0.003, 0.004, 0.005, eps_20c, 1.5 * eps_20c]
@@ -438,7 +465,7 @@ def plot_moment_curvature(results_by_mode, out_dir):
 # --- Main ---
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="CE 676 HW3 - Moment-Curvature Analysis")
+        description="Moment-Curvature Analysis")
     parser.add_argument(
         "--mode", choices=["whole", "split", "full", "all"],
         default="all",
